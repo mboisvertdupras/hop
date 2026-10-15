@@ -14,7 +14,7 @@ mod ui;
 
 use std::collections::VecDeque;
 use std::env;
-use std::io::{self, Write as _};
+use std::io::{self, IsTerminal as _, Write as _};
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::{Command, ExitStatus};
@@ -126,6 +126,11 @@ impl Shell {
 }
 
 fn main() -> io::Result<()> {
+    if !(io::stdin().is_terminal() && io::stdout().is_terminal()) {
+        eprintln!("hop: needs an interactive terminal");
+        std::process::exit(1);
+    }
+
     // While ssh runs, hop and ssh share the terminal's foreground process
     // group, so a Ctrl-C during connection setup signals both. A flag handler
     // keeps hop alive; exec resets handlers to default, so ssh still gets the
@@ -144,7 +149,11 @@ fn main() -> io::Result<()> {
     });
     let mut app = App::new(catalog, shell.paths.home.clone());
 
-    let mut terminal = ratatui::init();
+    let mut terminal = ratatui::try_init().unwrap_or_else(|e| {
+        ratatui::restore(); // init may fail after raw mode is on
+        eprintln!("hop: could not set up the terminal: {e}");
+        std::process::exit(1);
+    });
     let result = run_loop(&mut terminal, &mut app, &mut shell);
     ratatui::restore();
     result
