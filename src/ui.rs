@@ -40,9 +40,10 @@ pub fn render(app: &App, frame: &mut Frame) {
         Mode::Form(form) => render_form(form, frame),
         Mode::Confirm { prompt, .. } => {
             const WIDTH: u16 = 70;
-            let rows = prompt.chars().count().div_ceil(usize::from(WIDTH - 2)) as u16 + 1;
+            let paragraph = Paragraph::new(prompt.as_str()).wrap(Wrap { trim: false });
+            let rows = paragraph.line_count(WIDTH - 2) as u16;
             let area = popup(frame, WIDTH, rows + 2, " Confirm ");
-            frame.render_widget(Paragraph::new(prompt.as_str()).wrap(Wrap { trim: false }), area);
+            frame.render_widget(paragraph, area);
         }
         Mode::SetGroup { alias, input } => {
             let area = popup(frame, 50, 4, &format!(" Group for {alias} "));
@@ -165,7 +166,7 @@ fn detail_text<'a>(app: &'a App, entry: &'a HostEntry) -> Text<'a> {
     }
     let (path, line) = config.location(entry);
     let lock = if config.is_writable(entry) { "" } else { "  (read-only)" };
-    lines.push(field("Source", format!("{}:{line}{lock}", tilde(path, &app.home))));
+    lines.push(field("Source", format!("{}:{line}{lock}", tilde(path, &app.canonical_home))));
     if let Some(notes) = &meta.notes {
         lines.push(Line::from(""));
         lines.extend(notes.lines().map(Line::from));
@@ -213,34 +214,36 @@ fn render_form(form: &Form, frame: &mut Frame) {
     .into_iter()
     .flatten()
     .collect();
-    let fields: Vec<(FieldId, u16)> = FieldId::all()
-        .map(|f| {
-            let rows = if f == FieldId::Extras { EXTRAS_ROWS } else { 1 };
-            let error = u16::from(form.error.as_ref().is_some_and(|(e, _)| *e == f));
-            (f, rows + error)
+    let heights: Vec<u16> = form
+        .fields
+        .iter()
+        .map(|(f, _)| {
+            let rows = if *f == FieldId::Extras { EXTRAS_ROWS } else { 1 };
+            let error = u16::from(form.error.as_ref().is_some_and(|(e, _)| e == f));
+            rows + error
         })
         .collect();
-    let height = notices.len() as u16 + fields.iter().map(|(_, h)| h).sum::<u16>() + 3;
+    let height = notices.len() as u16 + heights.iter().sum::<u16>() + 3;
     let area = popup(frame, 76, height, &title);
 
     let constraints = std::iter::once(Constraint::Length(notices.len() as u16))
-        .chain(fields.iter().map(|(_, h)| Constraint::Length(*h)))
+        .chain(heights.iter().map(|&h| Constraint::Length(h)))
         .chain([Constraint::Length(1)]);
     let areas = Layout::vertical(constraints).split(area);
     frame.render_widget(Text::from(notices), areas[0]);
-    for (i, (field, _)) in fields.iter().enumerate() {
+    for (i, (field, textarea)) in form.fields.iter().enumerate() {
         let [label, input] = Layout::horizontal([Constraint::Length(18), Constraint::Min(0)]).areas(areas[i + 1]);
         let style = if i == form.focus { Style::default().bold() } else { Style::default().dim() };
         frame.render_widget(Line::from(field.label()).style(style), label);
         let [value, error] = Layout::vertical([Constraint::Min(1), Constraint::Length(u16::from(form.error.as_ref().is_some_and(|(e, _)| e == field)))]).areas(input);
         if i == form.focus {
-            frame.render_widget(&form.inputs[i], value);
+            frame.render_widget(textarea, value);
         } else {
-            frame.render_widget(Text::from(form.inputs[i].lines().iter().map(|l| Line::from(l.as_str())).collect::<Vec<_>>()), value);
+            frame.render_widget(Text::from(textarea.lines().iter().map(|l| Line::from(l.as_str())).collect::<Vec<_>>()), value);
         }
         if let Some((_, message)) = form.error.as_ref().filter(|(e, _)| e == field) {
             frame.render_widget(Line::from(message.as_str()).red(), error);
         }
     }
-    frame.render_widget(Line::from("Tab/Shift-Tab move   Ctrl-U clear field   Ctrl-S save   Esc cancel").dim(), areas[fields.len() + 1]);
+    frame.render_widget(Line::from("Tab/Shift-Tab move   Ctrl-U clear field   Ctrl-S save   Esc cancel").dim(), areas[form.fields.len() + 1]);
 }
