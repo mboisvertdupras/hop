@@ -1,13 +1,3 @@
-//! The ssh config as original text plus spans into it.
-//!
-//! hop never re-serializes a file. Each `ConfigFile` keeps the exact bytes it
-//! read, and every parsed thing (line, directive value, Host name token, block)
-//! is a byte range into those bytes. An edit is a list of `(range, replacement)`
-//! splices, so any byte outside a replaced range is the original byte by
-//! construction, not by a careful printer.
-//!
-//! Everything below `load` and `commit` is pure: `&str` in, `String`/spans out.
-
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fmt;
@@ -21,9 +11,6 @@ use serde::{Deserialize, Serialize};
 
 pub type Span = Range<usize>;
 
-/// A concrete host name usable as `ssh <alias>`.
-/// Invariant: non-empty, no whitespace, none of `* ? ! ,`, does not start with `-`
-/// (so it can never be read as an ssh option).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct Alias(String);
@@ -85,8 +72,6 @@ impl fmt::Display for AliasError {
     }
 }
 
-/// The five directives the form edits as fields. This enum is the one list:
-/// parsing, patching, and the form's field order all iterate `CoreKey::ALL`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CoreKey {
     HostName,
@@ -104,7 +89,6 @@ impl CoreKey {
         CoreKey::IdentityFile,
         CoreKey::ProxyJump,
     ];
-    /// Spelling used for lines hop inserts. Existing lines keep their own casing.
     pub fn keyword(self) -> &'static str {
         match self {
             CoreKey::HostName => "HostName",
@@ -119,8 +103,6 @@ impl CoreKey {
     }
 }
 
-/// Raw core values as written in the file, unquoted. Indexed by `CoreKey as usize`.
-/// hop does not interpret them (probing uses `ssh -G`), so it does not type them.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Core(pub [Option<String>; 5]);
 
@@ -137,8 +119,6 @@ impl std::ops::IndexMut<CoreKey> for Core {
     }
 }
 
-/// `Core` after form validation. Values stay verbatim (Port "022" is not
-/// normalized to "22") so an untouched field compares equal to the file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValidCore(Core);
 
@@ -163,10 +143,6 @@ impl ValidCore {
     }
 }
 
-/// The "other directives" text. Verbatim lines of the block that are not the
-/// first occurrence of a core key, de-indented: further directives, comments,
-/// blank lines, a second IdentityFile. Invariant: no `Host` or `Match` line,
-/// because one would split the block on write.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Extras(String);
 
@@ -186,13 +162,11 @@ impl Extras {
     }
 }
 
-/// 1-based line of the offending `Host` or `Match` line.
 #[derive(Debug)]
 pub struct ExtrasError {
     pub line: usize,
 }
 
-/// What the form submits. Built only from validated parts.
 #[derive(Clone, Debug)]
 pub struct HostSpec {
     pub alias: Alias,
@@ -215,13 +189,8 @@ pub struct BlockRef {
     pub block: usize,
 }
 
-/// All files reachable from the root through `Include`, plus the host list
-/// derived from them at load. Immutable; a reload builds a new one.
 pub struct ConfigSet {
-    /// `files[0]` is the root (`~/.ssh/config`), possibly empty if it does not exist.
     files: Vec<ConfigFile>,
-    /// ssh evaluation order (Includes inlined where they appear), one entry per
-    /// concrete name, deduplicated by alias with the first definition winning.
     hosts: Vec<HostEntry>,
 }
 
@@ -231,20 +200,15 @@ struct ConfigFile {
     path: PathBuf,
     text: String,
     parsed: Parsed,
-    /// access(2) W_OK on the file and on its directory (the rename needs both).
     writable: bool,
 }
 
 struct Parsed {
-    /// A partition of the text: concatenating every span reproduces it.
     lines: Vec<Line>,
-    /// In file order. Lines before the first block form the preamble and belong
-    /// to no block.
     blocks: Vec<Block>,
 }
 
 struct Line {
-    /// Includes the trailing '\n' (the last line may lack one).
     span: Span,
     kind: LineKind,
 }
@@ -252,44 +216,32 @@ struct Line {
 enum LineKind {
     Blank,
     Comment,
-    /// `Key value`, `Key=value`, `Key = value`. Quotes stay inside `value`.
     Directive { key: Span, value: Span },
 }
 
 struct Block {
-    /// Leading attached comments through the last non-blank body line.
-    /// This exact byte range is the block's identity for stale detection.
     span: Span,
-    /// Index into `lines` of the first attached comment, or of the header.
     first: usize,
-    /// Index into `lines` of the `Host`/`Match` line.
     header: usize,
-    /// Line indices after the header up to the end of `span`.
     body: Range<usize>,
     kind: BlockKind,
 }
 
 enum BlockKind {
-    /// Every token on the Host line, in order, with its span.
     Host(Vec<(HostToken, Span)>),
-    /// Never listed, never edited. Kept because a Match line ends the previous block.
     Match,
 }
 
 enum HostToken {
     Concrete(Alias),
-    /// Wildcards, negations, or anything `Alias::parse` rejects.
     Pattern,
 }
 
-/// One list row's worth of ssh data. `core` and `extras` are derived from the block's lines.
 pub struct HostEntry {
     pub alias: Alias,
     pub block: BlockRef,
     pub core: Core,
     pub extras: Extras,
-    /// Other concrete names on the same Host line. The form warns that field
-    /// edits apply to all of them.
     pub siblings: Vec<Alias>,
 }
 
@@ -310,7 +262,6 @@ struct Loader<'a> {
     seen: HashSet<Alias>,
 }
 
-/// What a file contributes, in line order, so Includes inline where they appear.
 enum Step {
     Include(Vec<PathBuf>),
     Header(usize),
@@ -400,9 +351,6 @@ impl Loader<'_> {
 }
 
 impl ConfigSet {
-    /// Reads `root` and everything it Includes. A missing root yields an empty,
-    /// writable root file (adding a host creates it). Unmatched globs are
-    /// ignored, as ssh ignores them.
     pub fn load(root: &Path, ssh_dir: &Path) -> Result<ConfigSet, LoadError> {
         let mut loader = Loader {
             ssh_dir,
@@ -427,7 +375,6 @@ impl ConfigSet {
         self.hosts.iter().find(|h| h.alias == *alias)
     }
 
-    /// File and 1-based line of the Host line, for the detail pane and confirm prompt.
     pub fn location(&self, entry: &HostEntry) -> (&Path, usize) {
         let file = &self.files[entry.block.file.0];
         (&file.path, file.parsed.blocks[entry.block.block].header + 1)
@@ -437,17 +384,12 @@ impl ConfigSet {
         self.files[entry.block.file.0].writable
     }
 
-    /// The Host line as written, for the delete prompt.
     pub fn host_line(&self, entry: &HostEntry) -> &str {
         let file = &self.files[entry.block.file.0];
         let line = &file.parsed.lines[file.parsed.blocks[entry.block.block].header];
         file.text[line.span.clone()].trim()
     }
 
-    /// Pure. Turns a change into a write plan against the loaded text.
-    /// `Ok(None)` means the ssh config needs no change (meta-only edits, or a
-    /// form saved untouched), which is why a read-only host can still be
-    /// grouped, favorited, and annotated.
     pub fn plan(&self, change: &HostChange) -> Result<Option<Plan>, PlanError> {
         match change {
             HostChange::Add(spec) => {
@@ -492,7 +434,6 @@ impl ConfigSet {
         }
     }
 
-    /// The block's bytes and which of the byte-identical blocks it is, refusing read-only files.
     fn address(&self, entry: &HostEntry) -> Result<(String, usize), PlanError> {
         let file = &self.files[entry.block.file.0];
         if !file.writable {
@@ -527,8 +468,6 @@ impl fmt::Display for PlanError {
     }
 }
 
-/// A content-addressed edit. It names the block by its exact bytes, not by
-/// offset, so it can be re-applied to a file that changed elsewhere.
 #[derive(Clone, Debug)]
 pub struct Plan {
     path: PathBuf,
@@ -537,25 +476,17 @@ pub struct Plan {
 
 #[derive(Clone, Debug)]
 enum PlanOp {
-    /// `ordinal` disambiguates byte-identical blocks: the n-th block whose text
-    /// equals `expected`.
     Rewrite { expected: String, ordinal: usize, replacement: String },
     Remove { expected: String, ordinal: usize },
-    /// A new Host block for the root file. Position is decided against fresh text.
     Insert { block: String },
 }
 
 #[derive(Debug)]
 pub enum CommitError {
-    /// The block is no longer in the file byte-for-byte.
     Stale,
     Io(io::Error),
 }
 
-/// IO shell around `rebase`: re-read `plan.path`, rebase, write a temp file in
-/// the same directory with the original mode, fsync, rename over the target.
-/// No backup file. Running it twice: the second run sees the block already
-/// rewritten and refuses with `Stale`, which is the compare-and-swap working.
 pub fn commit(plan: &Plan) -> Result<(), CommitError> {
     let fresh = match fs::read_to_string(&plan.path) {
         Ok(text) => text,
@@ -566,8 +497,6 @@ pub fn commit(plan: &Plan) -> Result<(), CommitError> {
     write_atomic(&plan.path, &text).map_err(CommitError::Io)
 }
 
-/// Temp file in the target's directory, the target's mode (0600 for a new
-/// file, in a directory created 0700), fsync, rename.
 pub fn write_atomic(path: &Path, text: &str) -> io::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     let mode = match fs::metadata(path) {
@@ -586,8 +515,6 @@ pub fn write_atomic(path: &Path, text: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Pure core of `commit`. Finds the plan's block in freshly read text and
-/// applies the plan there. Changes to other blocks in the same file survive.
 fn rebase(fresh: &str, op: &PlanOp) -> Result<String, CommitError> {
     let parsed = parse(fresh);
     let find = |expected: &str, ordinal: usize| {
@@ -653,10 +580,6 @@ fn indent_len(text: &str, line: &Line) -> usize {
     content.len() - content.trim_start().len()
 }
 
-/// Lines, then blocks. A Host or Match directive starts a block. A run of
-/// comment lines directly above the header (no blank line between, indent no
-/// deeper than the header's) is attached to it. A block ends at its last
-/// non-blank line before the next block's attached comments.
 fn parse(text: &str) -> Parsed {
     let mut lines = Vec::new();
     let mut at = 0;
@@ -726,8 +649,6 @@ fn unquote(value: &str) -> &str {
         .unwrap_or(value)
 }
 
-/// Line indices of the first occurrence of each core key, and of every other body line.
-/// A core keyword with no value is left among the extras, since it sets nothing.
 fn classify(file: &ConfigFile, block: &Block) -> ([Option<usize>; 5], Vec<usize>) {
     let mut core = [None; 5];
     let mut extras = Vec::new();
@@ -762,8 +683,6 @@ fn block_fields(file: &ConfigFile, block: &Block) -> (Core, Extras) {
     (core, Extras(extras))
 }
 
-/// Applies non-overlapping splices; edits are sorted by (start, end) so an
-/// insertion at `p` lands before a deletion starting at `p`.
 fn splice(text: &str, edits: &mut [(Span, String)]) -> String {
     edits.sort_by_key(|(span, _)| (span.start, span.end));
     let mut out = String::with_capacity(text.len());
@@ -781,7 +700,6 @@ fn line_indent<'a>(file: &'a ConfigFile, line: &Line) -> &'a str {
     &file.text[line.span.start..line.span.start + indent_len(&file.text, line)]
 }
 
-/// The file's first indented directive's indent, else four spaces.
 fn default_indent(file: &ConfigFile) -> &str {
     file.parsed
         .lines
@@ -792,8 +710,6 @@ fn default_indent(file: &ConfigFile) -> &str {
         .unwrap_or("    ")
 }
 
-/// The insertion after `anchor`; when the anchor is the file's unterminated
-/// last line, the newline moves to the front so the file keeps ending without one.
 fn insert_after(file: &ConfigFile, anchor: usize, lines: &[String]) -> Option<(Span, String)> {
     if lines.is_empty() {
         return None;
@@ -817,8 +733,6 @@ fn render_extras(extras: &Extras, indent: &str) -> Vec<String> {
         .collect()
 }
 
-/// New text for one block, built as splices relative to the block start.
-/// Identity law: `rewrite_block(f, b, &e.alias, &spec_of(e)) == &f.text[b.span]`.
 fn rewrite_block(file: &ConfigFile, block: usize, editing: &Alias, spec: &HostSpec) -> String {
     let b = &file.parsed.blocks[block];
     let BlockKind::Host(tokens) = &b.kind else { unreachable!("host entries come from Host blocks") };
@@ -873,7 +787,6 @@ fn rewrite_block(file: &ConfigFile, block: usize, editing: &Alias, spec: &HostSp
     splice(file.block_text(block), &mut edits)
 }
 
-/// Removes one token from a Host line with one adjacent whitespace run.
 fn remove_name(file: &ConfigFile, block: usize, alias: &Alias) -> String {
     let b = &file.parsed.blocks[block];
     let BlockKind::Host(tokens) = &b.kind else { unreachable!("host entries come from Host blocks") };
@@ -889,9 +802,6 @@ fn remove_name(file: &ConfigFile, block: usize, alias: &Alias) -> String {
     splice(file.block_text(block), &mut [(span.start - at..span.end - at, String::new())])
 }
 
-/// The block span, extended over the following blank lines when the block is
-/// preceded by a blank line or the start of file, so deletions do not leave
-/// doubled gaps. Comments outside the span are never removed.
 fn removal_range(parsed: &Parsed, block: usize) -> Span {
     let b = &parsed.blocks[block];
     let after_gap = b.first == 0 || matches!(parsed.lines[b.first - 1].kind, LineKind::Blank);
@@ -907,10 +817,8 @@ fn removal_range(parsed: &Parsed, block: usize) -> Span {
     b.span.start..end
 }
 
-/// Where a new host goes in the root file: before the trailing run of
-/// catch-all blocks (`Host *`-style pattern-only blocks and `Match` blocks),
-/// else at EOF. ssh takes the first value it sees for each option, so a host
-/// appended after a trailing `Host *` would have its User or Port overridden.
+/// ssh takes the first value it sees for each option, so a host appended
+/// after a trailing `Host *` would have its User or Port overridden.
 fn insertion_point(parsed: &Parsed, text: &str) -> usize {
     parsed
         .blocks
@@ -935,7 +843,6 @@ fn render_new_block(spec: &HostSpec, indent: &str) -> String {
     block
 }
 
-/// Wraps in double quotes when the value contains whitespace.
 fn render_value(value: &str) -> Cow<'_, str> {
     if value.contains(char::is_whitespace) {
         Cow::Owned(format!("\"{value}\""))
@@ -990,7 +897,6 @@ mod tests {
         HostSpec { core: ValidCore::parse(core).unwrap(), ..spec_of(entry) }
     }
 
-    /// The root file's text after applying `change` to its loaded text.
     fn edited(set: &ConfigSet, change: HostChange) -> String {
         let plan = set.plan(&change).unwrap().expect("a change to the ssh config");
         rebase(&set.files[0].text, &plan.op).unwrap()

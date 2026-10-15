@@ -1,5 +1,3 @@
-//! Drawing only. Reads `App`, writes a frame, holds no state of its own.
-
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style, Stylize};
@@ -28,12 +26,6 @@ q              quit
 
 In the form: Tab / Shift-Tab move, Ctrl-U clears the field,\nCtrl-S saves, Esc cancels.";
 
-/// Layout: header (view name, probe progress), list (rows from `app::rows`),
-/// detail pane for the cursor host (HostName, User, Port, source file:line,
-/// notes, a lock glyph when read-only), status line, then the mode overlay
-/// (search input, form, confirm, group prompt, help) on top.
-///
-/// Row suffix by reach: `·` Probing, `12ms` Up, `down` Down, `via jump` ViaJump.
 pub fn render(app: &App, frame: &mut Frame) {
     let [header, body, status] = Layout::vertical([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)]).areas(frame.area());
     let [list, detail] = Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]).areas(body);
@@ -48,7 +40,6 @@ pub fn render(app: &App, frame: &mut Frame) {
         Mode::Form(form) => render_form(form, frame),
         Mode::Confirm { prompt, .. } => {
             const WIDTH: u16 = 70;
-            // One spare row because word wrapping can need more rows than chars / width.
             let rows = prompt.chars().count().div_ceil(usize::from(WIDTH - 2)) as u16 + 1;
             let area = popup(frame, WIDTH, rows + 2, " Confirm ");
             frame.render_widget(Paragraph::new(prompt.as_str()).wrap(Wrap { trim: false }), area);
@@ -194,8 +185,6 @@ fn render_status(app: &App, frame: &mut Frame, area: Rect) {
     frame.render_widget(line, area);
 }
 
-/// A bordered, cleared box of `width` columns and `height` rows centered on
-/// the frame; returns its inner area.
 fn popup(frame: &mut Frame, width: u16, height: u16, title: &str) -> Rect {
     let area = frame.area().centered(Constraint::Length(width), Constraint::Length(height));
     let block = Block::bordered().title(title.to_owned());

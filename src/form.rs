@@ -1,14 +1,9 @@
-//! The add/edit form. A boundary: free text in, `HostChange` + `MetaOp`s out.
-//! Validation happens here once; `ssh_config` and `meta` trust what they get.
-
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui_textarea::{CursorMove, TextArea};
 
 use crate::meta::{GroupPath, Meta, MetaOp};
 use crate::ssh_config::{Alias, Core, CoreKey, Extras, HostChange, HostEntry, HostSpec, ValidCore};
 
-/// Field order on screen, derived from `CoreKey::ALL` so a new core key
-/// cannot be parsed but missing from the form.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FieldId {
     Alias,
@@ -40,18 +35,14 @@ impl FieldId {
 
 pub enum FormKind {
     Add,
-    /// `siblings` drives the "also applies to web.example.com" warning.
     Edit { original: Alias, siblings: Vec<Alias> },
 }
 
 pub struct Form {
     pub kind: FormKind,
-    /// One editor per `FieldId::all()` entry, same order. Only Extras is multi-line.
     pub inputs: Vec<TextArea<'static>>,
     pub focus: usize,
-    /// Field-level validation or plan error, shown under the field.
     pub error: Option<(FieldId, String)>,
-    /// Shown above the form after a refused save ("changed on disk, reloaded").
     pub banner: Option<String>,
 }
 
@@ -61,11 +52,8 @@ pub enum FormAction {
     Cancel,
 }
 
-/// The form's output, ready to plan and persist.
 pub struct Submission {
     pub change: HostChange,
-    /// For Edit with a rename, `Rename` comes first so the group and notes
-    /// ops address the new alias.
     pub meta: Vec<MetaOp>,
 }
 
@@ -108,8 +96,6 @@ impl Form {
         FieldId::all().nth(self.focus).unwrap_or(FieldId::Alias)
     }
 
-    /// Tab / Shift-Tab move focus. Enter moves to the next field except in
-    /// Extras, where it is a newline. Ctrl-U clears the focused field. Ctrl-S submits from any field. Esc cancels.
     pub fn handle_key(&mut self, key: KeyEvent) -> FormAction {
         let fields = self.inputs.len();
         match key.code {
@@ -135,16 +121,12 @@ impl Form {
         self.inputs[field.index()].lines().join("\n")
     }
 
-    /// Trimmed; blank is None.
     fn value(&self, field: FieldId) -> Option<String> {
         let text = self.text(field);
         let text = text.trim();
         (!text.is_empty()).then(|| text.to_owned())
     }
 
-    /// Pure over the inputs. Alias via `Alias::parse`, core via
-    /// `ValidCore::parse`, group via `GroupPath::parse`, extras via
-    /// `Extras::parse`. Notes: blank is None. First failure wins.
     pub fn submission(&self) -> Result<Submission, (FieldId, String)> {
         let alias = Alias::parse(self.text(FieldId::Alias).trim()).map_err(|e| (FieldId::Alias, e.to_string()))?;
         let core = Core(CoreKey::ALL.map(|k| self.value(FieldId::Core(k))));
@@ -171,7 +153,6 @@ impl Form {
         Ok(Submission { change, meta })
     }
 
-    /// The alias the list cursor should land on after a successful save.
     pub fn target_alias(&self) -> Option<Alias> {
         Alias::parse(self.text(FieldId::Alias).trim()).ok()
     }

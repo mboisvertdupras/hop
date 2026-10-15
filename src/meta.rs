@@ -1,18 +1,3 @@
-//! hop's own store: `$XDG_CONFIG_HOME/hop/meta.toml` (default `~/.config`, on
-//! macOS too). Keyed by alias. Entries with no matching host are carried
-//! through every write untouched, so a host that comes back finds its metadata.
-//!
-//! Every change is a `MetaOp` applied as read-modify-write against the file on
-//! disk, never a dump of hop's in-memory copy. Two hop instances therefore
-//! merge instead of clobbering each other.
-//!
-//! File shape:
-//!   [hosts.web]
-//!   group = "clients/acme"
-//!   favorite = true
-//!   last_used = 1760500000
-//!   notes = "behind the VPN"
-
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
@@ -23,15 +8,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::ssh_config::{Alias, write_atomic};
 
-/// `clients/acme`. Invariant: at least one segment, no empty segment.
-/// Serialized as the slash-joined string.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct GroupPath(Vec<String>);
 
 impl GroupPath {
-    /// Trims slashes and whitespace around segments; blank input is `Ok(None)`
-    /// so the form and the `g` prompt use one parser for "clear the group".
     pub fn parse(raw: &str) -> Result<Option<GroupPath>, GroupError> {
         let trimmed = raw.trim().trim_matches('/');
         if trimmed.trim().is_empty() {
@@ -46,7 +27,6 @@ impl GroupPath {
     pub fn segments(&self) -> &[String] {
         &self.0
     }
-    /// `a/b/c` -> [`a`, `a/b`, `a/b/c`]; the tree builder walks these.
     pub fn ancestors_and_self(&self) -> impl Iterator<Item = GroupPath> + '_ {
         (1..=self.0.len()).map(|n| GroupPath(self.0[..n].to_vec()))
     }
@@ -80,8 +60,6 @@ impl fmt::Display for GroupError {
     }
 }
 
-/// Seconds since the Unix epoch. Enough for "sort by recent" and "3d ago";
-/// avoids a date-time crate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct UnixTime(pub u64);
 
@@ -91,7 +69,6 @@ impl UnixTime {
     }
 }
 
-/// Pure. "now", "5m", "3h", "2d", "6w".
 pub fn age(then: UnixTime, now: UnixTime) -> String {
     let secs = now.0.saturating_sub(then.0);
     match secs {
@@ -115,7 +92,6 @@ pub struct Meta {
     pub notes: Option<String>,
 }
 
-/// BTreeMap so the file's entry order is stable across writes.
 pub type MetaMap = BTreeMap<Alias, Meta>;
 
 #[derive(Default, Serialize, Deserialize)]
@@ -124,23 +100,16 @@ struct MetaFile {
     hosts: MetaMap,
 }
 
-/// Every op converges: applying it twice equals applying it once. That is
-/// why there is `SetFavorite(bool)` and no toggle: the UI turns the key press
-/// into the target value it is showing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MetaOp {
     SetFavorite(Alias, bool),
     SetGroup(Alias, Option<GroupPath>),
     SetNotes(Alias, Option<String>),
-    /// Keeps the later of the stored and the new time, so concurrent instances commute.
     Touch(Alias, UnixTime),
-    /// Moves the entry; overwrites any orphan already stored under `to`.
-    /// A no-op when `from` has no entry (e.g. the second run).
     Rename { from: Alias, to: Alias },
     Remove(Alias),
 }
 
-/// Pure. An entry left equal to `Meta::default()` is removed, keeping the file small.
 pub fn apply(map: &mut MetaMap, op: &MetaOp) {
     match op {
         MetaOp::SetFavorite(alias, favorite) => map.entry(alias.clone()).or_default().favorite = *favorite,
@@ -165,7 +134,6 @@ pub fn apply(map: &mut MetaMap, op: &MetaOp) {
 #[derive(Debug)]
 pub enum MetaError {
     Io(io::Error),
-    /// The file exists but does not parse. hop refuses to write over it.
     Corrupt(String),
 }
 
@@ -187,7 +155,6 @@ impl MetaStore {
         MetaStore { path }
     }
 
-    /// Missing file is an empty map.
     pub fn load(&self) -> Result<MetaMap, MetaError> {
         let text = match std::fs::read_to_string(&self.path) {
             Ok(text) => text,
@@ -199,9 +166,6 @@ impl MetaStore {
             .map_err(|e| MetaError::Corrupt(e.to_string()))
     }
 
-    /// Re-read, apply each op, write atomically (temp file + rename), return
-    /// what is now on disk. The returned map replaces the UI's copy wholesale,
-    /// so the UI never holds a version that was not persisted.
     pub fn update(&self, ops: &[MetaOp]) -> Result<MetaMap, MetaError> {
         let before = self.load()?;
         let mut hosts = before.clone();

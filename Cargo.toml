@@ -18,17 +18,16 @@ publish = false
 dist = true
 
 [dependencies]
-ratatui = "0.30.2"                                 # TUI; re-exports crossterm 0.29, so no second pin
-ratatui-textarea = "0.9.3"                         # form inputs, incl. the multi-line "other directives" area; ratatui-org successor to tui-textarea, which is stuck on ratatui 0.29
-nucleo-matcher = "0.3.1"                           # fuzzy scoring (helix's matcher), no threads of its own
+ratatui = "0.30.2"                                 # re-exports crossterm 0.29, so no second pin
+ratatui-textarea = "0.9.3"
+nucleo-matcher = "0.3.1"
 serde = { version = "1.0.229", features = ["derive"] }
-toml = "1.1.8"                                     # meta.toml, which hop owns outright
-glob = "0.3.4"                                     # Include globs
-tempfile = "3.27.0"                                # same-directory temp file + atomic rename
-rustix = { version = "1.1.5", features = ["fs"] }  # access(2) for the read-only check; already in tempfile's tree
-signal-hook = "0.4.5"                              # keep hop alive when Ctrl-C hits the shared process group during ssh
+toml = "1.1.8"
+glob = "0.3.4"
+tempfile = "3.27.0"
+rustix = { version = "1.1.5", features = ["fs"] }
+signal-hook = "0.4.5"
 
-# The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"
 lto = "thin"
