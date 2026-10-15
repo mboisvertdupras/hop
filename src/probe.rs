@@ -155,7 +155,6 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::net::TcpListener;
-    use std::os::unix::fs::PermissionsExt;
 
     fn alias(s: &str) -> Alias {
         Alias::parse(s).unwrap()
@@ -164,8 +163,15 @@ mod tests {
     /// A stand-in for ssh that prints `output` for `-G`.
     fn fake_ssh(dir: &Path, script: &str) -> PathBuf {
         let path = dir.join("ssh");
-        fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        // Written by a child process: a write fd held here would leak into children that
+        // parallel tests fork, and Linux then refuses to exec the script (ETXTBSY).
+        let status = Command::new("sh")
+            .args(["-c", r#"printf '%s' "$1" > "$2" && chmod 755 "$2""#, "sh"])
+            .arg(format!("#!/bin/sh\n{script}\n"))
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
         path
     }
 
