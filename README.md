@@ -12,6 +12,8 @@ With the shell installer from GitHub Releases:
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/mboisvertdupras/hop/releases/latest/download/hop-installer.sh | sh
 ```
 
+The installer puts `hop` in `~/.local/bin` and adds that directory to your shell's `PATH` if needed.
+
 With Homebrew:
 
 ```sh
