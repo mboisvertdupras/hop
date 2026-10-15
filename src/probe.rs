@@ -1,11 +1,3 @@
-//! Background reachability. Workers own nothing the UI owns: they receive
-//! aliases and send `(Alias, Reach)` messages. The main thread is the only
-//! writer of the reach map.
-//!
-//! Cancellation is structural. A refresh drops the old `Prober`: its cancel
-//! flag stops workers from taking new jobs, and its receiver is gone, so any
-//! in-flight result fails to send and vanishes. No generation counters.
-
 use std::io::Read as _;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -38,8 +30,6 @@ pub struct Prober {
 }
 
 impl Prober {
-    /// Queues every alias and starts up to `WORKERS` threads. Each worker loops:
-    /// check `cancel`, take the next alias from the shared queue, `probe`, send.
     pub fn start(aliases: Vec<Alias>) -> Prober {
         Prober::with_ssh(PathBuf::from("ssh"), aliases)
     }
@@ -65,7 +55,6 @@ impl Prober {
         Prober { results, cancel }
     }
 
-    /// Non-blocking drain for the event loop.
     pub fn drain(&self) -> impl Iterator<Item = (Alias, Reach)> + '_ {
         self.results.try_iter()
     }
@@ -77,18 +66,12 @@ impl Drop for Prober {
     }
 }
 
-/// What `ssh -G` says about how ssh would reach the host.
 #[derive(Debug, PartialEq, Eq)]
 enum Target {
     Direct { host: String, port: u16 },
-    /// `proxyjump` or `proxycommand` is set (from any matching block, wildcards
-    /// included). A direct TCP probe would test the wrong path.
     ViaJump,
 }
 
-/// Blocking; runs on a worker. `ssh -G -- <alias>` (killed after
-/// SSH_G_TIMEOUT), `parse_ssh_g`, then `connect_timeout` to each resolved
-/// address until one answers. ssh -G failure or no address => Down.
 fn probe(ssh: &Path, alias: &Alias) -> Reach {
     match ssh_g(ssh, alias).as_deref().and_then(parse_ssh_g) {
         None => Reach::Down,
@@ -133,8 +116,6 @@ fn ssh_g(ssh: &Path, alias: &Alias) -> Option<String> {
     status.success().then_some(output)
 }
 
-/// Pure. Reads `hostname`, `port`, `proxyjump`, `proxycommand` lines; a value
-/// of `none` counts as unset.
 fn parse_ssh_g(output: &str) -> Option<Target> {
     let (mut host, mut port) = (None, None);
     for line in output.lines() {
@@ -160,7 +141,6 @@ mod tests {
         Alias::parse(s).unwrap()
     }
 
-    /// A stand-in for ssh that prints `output` for `-G`.
     fn fake_ssh(dir: &Path, script: &str) -> PathBuf {
         let path = dir.join("ssh");
         // Written by a child process: a write fd held here would leak into children that

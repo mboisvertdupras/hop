@@ -1,10 +1,3 @@
-//! The shell: terminal, event loop, effect execution. The only file that does
-//! IO on behalf of the UI. All decisions live in `app::update`.
-//!
-//! The main thread is the only reader of the terminal. There is no input
-//! thread, so nothing can steal keystrokes from ssh while it runs: during
-//! `Command::status()` the main thread is blocked and nobody else reads stdin.
-
 mod app;
 mod form;
 mod meta;
@@ -31,11 +24,9 @@ use meta::{MetaError, MetaOp, MetaStore, UnixTime};
 use probe::Prober;
 use ssh_config::{Alias, CommitError, ConfigSet};
 
-/// How long the loop waits for a key before draining probe results.
 const TICK: Duration = Duration::from_millis(50);
 
 struct Paths {
-    /// Canonical when resolvable, to match the canonical config paths shown against it.
     home: PathBuf,
     ssh_dir: PathBuf,
     ssh_config: PathBuf,
@@ -43,7 +34,6 @@ struct Paths {
 }
 
 impl Paths {
-    /// `$HOME/.ssh/config`; `$XDG_CONFIG_HOME/hop/meta.toml`, default `$HOME/.config`.
     fn from_env() -> io::Result<Paths> {
         let home = env::var_os("HOME")
             .filter(|h| !h.is_empty())
@@ -60,7 +50,6 @@ impl Paths {
     }
 }
 
-/// Everything the effects need. Owned by `main`, never shared.
 struct Shell {
     paths: Paths,
     store: MetaStore,
@@ -68,8 +57,6 @@ struct Shell {
 }
 
 impl Shell {
-    /// Reads both sources and restarts probes. Dropping the old `Prober`
-    /// cancels it (see probe.rs).
     fn read(&mut self) -> Result<Catalog, String> {
         let config = ConfigSet::load(&self.paths.ssh_config, &self.paths.ssh_dir)
             .map_err(|e| format!("{}: {}", e.path.display(), e.source))?;
@@ -97,7 +84,6 @@ impl Shell {
         }
     }
 
-    /// Runs one effect; returns the events describing its outcome.
     fn run(&mut self, terminal: &mut DefaultTerminal, effect: Effect) -> io::Result<Vec<Event>> {
         Ok(match effect {
             Effect::Quit => unreachable!("run_loop returns on Quit before calling run"),
@@ -105,13 +91,9 @@ impl Shell {
             Effect::Meta(ops) => vec![self.meta(&ops)],
             Effect::Connect(alias) => {
                 connect(terminal, &alias)?;
-                // Recorded whatever the exit status: the user did use the host.
                 vec![self.meta(&[MetaOp::Touch(alias, UnixTime::now())])]
             }
             Effect::Save { plan, meta } => match plan.as_ref().map(ssh_config::commit).transpose() {
-                // ssh config first, then meta: a crash between leaves an orphan
-                // meta entry under the old alias, which is harmless. A meta failure
-                // still reloads, because the ssh file did change.
                 Ok(_) => {
                     let meta_failure = self.store.update(&meta).err();
                     let mut events = vec![self.load(LoadReason::Saved)];
@@ -168,7 +150,6 @@ fn run_loop(terminal: &mut DefaultTerminal, app: &mut App, shell: &mut Shell) ->
         }
         events.extend(shell.prober.drain().map(|(alias, reach)| Event::Probe(alias, reach)));
 
-        // In arrival order. Effects append their outcome (Save -> Loaded), drained in the same pass.
         while let Some(event) = events.pop_front() {
             dirty = true;
             match app::update(app, event) {
@@ -180,7 +161,6 @@ fn run_loop(terminal: &mut DefaultTerminal, app: &mut App, shell: &mut Shell) ->
     }
 }
 
-/// Suspend, run ssh in the real terminal, keep failures on screen, resume.
 fn connect(terminal: &mut DefaultTerminal, alias: &Alias) -> io::Result<()> {
     ratatui::restore();
 
@@ -198,8 +178,6 @@ fn connect(terminal: &mut DefaultTerminal, alias: &Alias) -> io::Result<()> {
     Ok(())
 }
 
-/// Pure. None on exit 0. Otherwise the exit code, the signal, or the spawn
-/// error (ssh not on PATH).
 fn failure_message(alias: &Alias, status: &io::Result<ExitStatus>) -> Option<String> {
     Some(match status {
         Ok(status) if status.success() => return None,
@@ -212,8 +190,6 @@ fn failure_message(alias: &Alias, status: &io::Result<ExitStatus>) -> Option<Str
     })
 }
 
-/// Raw mode just long enough to read one key, so the user does not need Enter.
-/// Discards keys typed while ssh was exiting, then waits for a fresh one.
 fn wait_for_key() -> io::Result<()> {
     io::stdout().flush()?;
     terminal::enable_raw_mode()?;

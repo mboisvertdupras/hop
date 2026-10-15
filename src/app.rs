@@ -1,11 +1,3 @@
-//! The whole UI as a pure state machine: `update(&mut App, Event) -> Option<Effect>`.
-//! No IO, no terminal, no threads in this file. The shell in main.rs turns
-//! effects into IO and feeds the outcome back as events.
-//!
-//! Visible rows are never stored. `rows(app)` derives them from the catalog,
-//! the view, the collapsed set, and the mode on every call. The cursor is a
-//! `RowKey`, not an index, so reloads and probe results cannot shift it.
-
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap};
 use std::mem;
@@ -20,7 +12,6 @@ use crate::meta::{GroupPath, Meta, MetaMap, MetaOp};
 use crate::probe::Reach;
 use crate::ssh_config::{Alias, ConfigSet, CoreKey, HostChange, HostEntry, Plan, PlanError};
 
-/// ssh hosts joined with hop's metadata. Built by the shell, replaced whole.
 pub struct Catalog {
     pub config: ConfigSet,
     pub meta: MetaMap,
@@ -29,7 +20,6 @@ pub struct Catalog {
 const NO_META: &Meta = &Meta { group: None, favorite: false, last_used: None, notes: None };
 
 impl Catalog {
-    /// Missing entry reads as `Meta::default()`. Orphan entries are never read.
     pub fn meta(&self, alias: &Alias) -> &Meta {
         self.meta.get(alias).unwrap_or(NO_META)
     }
@@ -40,24 +30,18 @@ impl Catalog {
 
 pub struct App {
     pub catalog: Catalog,
-    /// For `tilde`; canonical like the config paths it is compared with.
     pub home: PathBuf,
-    /// Sole writer: `update` on `Event::Probe` and `Event::Loaded`.
     pub reach: HashMap<Alias, Reach>,
     pub view: View,
-    /// Groups start expanded; this holds the exceptions. Session-only.
     pub collapsed: BTreeSet<GroupPath>,
     pub cursor: Option<RowKey>,
     pub mode: Mode,
-    /// One-line message under the list; cleared by the next key.
     pub status: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum View {
-    /// Favorites section, then the group tree.
     Tree,
-    /// Flat, by `last_used` descending; never-used hosts last, by alias.
     Recent,
 }
 
@@ -65,8 +49,6 @@ pub enum Mode {
     List,
     Search { query: String },
     Form(Form),
-    /// Holds the exact effect it will emit, computed before asking, so what
-    /// the prompt describes is what runs.
     Confirm { prompt: String, on_yes: Effect },
     SetGroup { alias: Alias, input: String },
     Help,
@@ -75,8 +57,6 @@ pub enum Mode {
 pub enum Event {
     Key(KeyEvent),
     Probe(Alias, Reach),
-    /// A fresh read of ssh config and meta store. The shell restarts probes
-    /// with every load, so the reducer resets every alias to `Probing`.
     Loaded { catalog: Catalog, reason: LoadReason },
     MetaSaved(MetaMap),
     Failed(String),
@@ -85,10 +65,7 @@ pub enum Event {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LoadReason {
     Refresh,
-    /// The Save effect wrote. Form/Confirm return to List on the target alias.
     Saved,
-    /// The Save effect hit a stale block. A Form stays open with its draft and a
-    /// banner; the user reviews and saves again against the fresh file.
     Refused,
 }
 
@@ -97,7 +74,6 @@ pub enum Effect {
     Connect(Alias),
     Reload,
     Meta(Vec<MetaOp>),
-    /// `plan` is None when only metadata changed.
     Save { plan: Option<Plan>, meta: Vec<MetaOp> },
 }
 
@@ -108,7 +84,6 @@ pub enum RowKey {
 }
 
 pub enum Row<'a> {
-    /// "Favorites". Not selectable; cursor movement skips it.
     Section(&'static str),
     Group { path: GroupPath, depth: usize, expanded: bool, hosts: usize },
     Host { entry: &'a HostEntry, depth: usize },
@@ -140,7 +115,6 @@ impl App {
         app
     }
 
-    /// The host under the cursor.
     pub fn selected(&self) -> Option<&HostEntry> {
         match &self.cursor {
             Some(RowKey::Host(alias)) => self.catalog.config.host(alias),
@@ -155,7 +129,6 @@ fn probing(catalog: &Catalog) -> HashMap<Alias, Reach> {
 
 const REFUSED: &str = "This host changed on disk. Review and save again.";
 
-/// The transition function. See DESIGN.md "State machine" for the table.
 pub fn update(app: &mut App, event: Event) -> Option<Effect> {
     let effect = match event {
         Event::Key(key) => {
@@ -209,7 +182,6 @@ pub fn update(app: &mut App, event: Event) -> Option<Effect> {
     effect
 }
 
-/// Plain letters only, so Ctrl or Alt chords never trigger list commands.
 fn command(key: &KeyEvent) -> Option<char> {
     match key.code {
         KeyCode::Char(c) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => Some(c),
@@ -272,7 +244,6 @@ fn toggle(collapsed: &mut BTreeSet<GroupPath>, group: GroupPath) {
     }
 }
 
-/// Display text for a config path: `~/...` under `home`, otherwise unchanged.
 pub fn tilde(path: &Path, home: &Path) -> String {
     match path.strip_prefix(home) {
         Ok(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
@@ -305,8 +276,6 @@ fn move_cursor(app: &mut App, delta: isize) {
     app.cursor = Some(keys[next].clone());
 }
 
-/// On a group, collapses it. On a host inside a group, collapses that group
-/// and moves the cursor onto it, so the cursor never sits on a hidden row.
 fn collapse(app: &mut App) {
     let group = match &app.cursor {
         Some(RowKey::Group(group)) => Some(group.clone()),
@@ -364,7 +333,6 @@ fn form_key(app: &mut App, mut form: Form, key: KeyEvent) -> Option<Effect> {
     effect
 }
 
-/// The form stays open until the shell answers with `Loaded` or `Failed`.
 fn submit(config: &ConfigSet, home: &Path, form: &mut Form) -> Option<Effect> {
     form.error = None;
     form.banner = None;
@@ -406,9 +374,6 @@ fn set_group_key(app: &mut App, alias: Alias, mut input: String, key: KeyEvent) 
     None
 }
 
-/// Keeps the cursor on a visible row. A host hidden by a collapsed group (a
-/// favorite just unpinned, a search left with Esc) gets its groups expanded;
-/// a key that no longer exists falls back to the first row.
 fn fix_cursor(app: &mut App) {
     let visible = |app: &App| rows(app).iter().filter_map(Row::key).any(|k| Some(&k) == app.cursor.as_ref());
     if visible(app) {
@@ -427,12 +392,6 @@ fn fix_cursor(app: &mut App) {
     app.cursor = rows(app).iter().find_map(Row::key);
 }
 
-/// Pure derivation of what the list shows.
-/// List/Tree: favorites section (flat, by alias, group shown as a suffix), then
-///   groups before ungrouped hosts, each level by name; a collapsed group hides
-///   its subtree. Favorites appear only in the section, so every RowKey is unique.
-/// List/Recent: flat, see `View::Recent`.
-/// Search: flat, ranked by `search`, favorites included, no section.
 pub fn rows(app: &App) -> Vec<Row<'_>> {
     let catalog = &app.catalog;
     if let Mode::Search { query } = &app.mode {
@@ -487,9 +446,6 @@ fn tree<'a>(app: &'a App, hosts: &[&'a HostEntry], groups: &BTreeSet<GroupPath>,
     );
 }
 
-/// Pure. nucleo-matcher over one haystack per host:
-/// "alias hostname user group notes". Smart case. Hosts whose alias matches
-/// rank above hosts that match only elsewhere; ties break on alias.
 pub fn search<'a>(catalog: &'a Catalog, query: &str) -> Vec<&'a HostEntry> {
     let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
     let mut matcher = Matcher::new(Config::DEFAULT);
@@ -588,7 +544,6 @@ mod tests {
         Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))
     }
 
-    /// Each char is one key press; returns every effect emitted, in order.
     fn press(app: &mut App, keys: &str) -> Vec<Effect> {
         keys.chars().filter_map(|c| update(app, key(KeyCode::Char(c)))).collect()
     }
