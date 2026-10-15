@@ -22,12 +22,12 @@ use ratatui::crossterm::{execute, terminal};
 use app::{App, Catalog, Effect, Event, LoadReason};
 use meta::{MetaError, MetaOp, MetaStore, UnixTime};
 use probe::Prober;
-use ssh_config::{Alias, CommitError, ConfigSet};
+use ssh_config::{Alias, CommitError, ConfigEdit, ConfigSet};
 
 const TICK: Duration = Duration::from_millis(50);
 
 struct Paths {
-    home: PathBuf,
+    canonical_home: PathBuf,
     ssh_dir: PathBuf,
     ssh_config: PathBuf,
     meta: PathBuf,
@@ -45,8 +45,8 @@ impl Paths {
             .unwrap_or_else(|| home.join(".config"));
         let ssh_dir = home.join(".ssh");
         let meta = config_home.join("hop/meta.toml");
-        let home = home.canonicalize().unwrap_or(home);
-        Ok(Paths { home, ssh_config: ssh_dir.join("config"), ssh_dir, meta })
+        let canonical_home = home.canonicalize().unwrap_or(home);
+        Ok(Paths { canonical_home, ssh_config: ssh_dir.join("config"), ssh_dir, meta })
     }
 }
 
@@ -84,6 +84,20 @@ impl Shell {
         }
     }
 
+    fn save(&mut self, ssh: ConfigEdit, meta: &[MetaOp]) -> Vec<Event> {
+        if let ConfigEdit::Write(plan) = ssh {
+            match ssh_config::commit(&plan) {
+                Ok(()) => {}
+                Err(CommitError::Stale) => return vec![self.load(LoadReason::Refused)],
+                Err(CommitError::Io(e)) => return vec![Event::Failed(e.to_string())],
+            }
+        }
+        let meta_failure = self.store.update(meta).err();
+        let mut events = vec![self.load(LoadReason::Saved)];
+        events.extend(meta_failure.map(|e| Event::Failed(self.meta_error(e))));
+        events
+    }
+
     fn run(&mut self, terminal: &mut DefaultTerminal, effect: Effect) -> io::Result<Vec<Event>> {
         Ok(match effect {
             Effect::Quit => unreachable!("run_loop returns on Quit before calling run"),
@@ -93,16 +107,7 @@ impl Shell {
                 connect(terminal, &alias)?;
                 vec![self.meta(&[MetaOp::Touch(alias, UnixTime::now())])]
             }
-            Effect::Save { plan, meta } => match plan.as_ref().map(ssh_config::commit).transpose() {
-                Ok(_) => {
-                    let meta_failure = self.store.update(&meta).err();
-                    let mut events = vec![self.load(LoadReason::Saved)];
-                    events.extend(meta_failure.map(|e| Event::Failed(self.meta_error(e))));
-                    events
-                }
-                Err(CommitError::Stale) => vec![self.load(LoadReason::Refused)],
-                Err(CommitError::Io(e)) => vec![Event::Failed(e.to_string())],
-            },
+            Effect::Save { ssh, meta } => self.save(ssh, &meta),
         })
     }
 }
@@ -129,7 +134,7 @@ fn main() -> io::Result<()> {
         eprintln!("hop: {message}");
         std::process::exit(1);
     });
-    let mut app = App::new(catalog, shell.paths.home.clone());
+    let mut app = App::new(catalog, shell.paths.canonical_home.clone());
 
     let mut terminal = ratatui::try_init().unwrap_or_else(|e| {
         ratatui::restore(); // init may fail after raw mode is on
@@ -202,15 +207,20 @@ fn failure_message(alias: &Alias, status: &io::Result<ExitStatus>) -> Option<Str
 fn wait_for_key() -> io::Result<()> {
     io::stdout().flush()?;
     terminal::enable_raw_mode()?;
-    while event::poll(Duration::ZERO)? {
-        event::read()?;
-    }
+    discard_pending_keys()?;
     loop {
         if let TermEvent::Key(_) = event::read()? {
             break;
         }
     }
     terminal::disable_raw_mode()
+}
+
+fn discard_pending_keys() -> io::Result<()> {
+    while event::poll(Duration::ZERO)? {
+        event::read()?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

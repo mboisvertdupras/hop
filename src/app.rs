@@ -10,7 +10,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::form::{FieldId, Form, FormAction};
 use crate::meta::{GroupPath, Meta, MetaMap, MetaOp};
 use crate::probe::Reach;
-use crate::ssh_config::{Alias, ConfigSet, CoreKey, HostChange, HostEntry, Plan, PlanError};
+use crate::ssh_config::{Alias, ConfigEdit, ConfigSet, CoreKey, HostChange, HostEntry, PlanError};
 
 pub struct Catalog {
     pub config: ConfigSet,
@@ -30,7 +30,7 @@ impl Catalog {
 
 pub struct App {
     pub catalog: Catalog,
-    pub home: PathBuf,
+    pub canonical_home: PathBuf,
     pub reach: HashMap<Alias, Reach>,
     pub view: View,
     pub collapsed: BTreeSet<GroupPath>,
@@ -74,7 +74,7 @@ pub enum Effect {
     Connect(Alias),
     Reload,
     Meta(Vec<MetaOp>),
-    Save { plan: Option<Plan>, meta: Vec<MetaOp> },
+    Save { ssh: ConfigEdit, meta: Vec<MetaOp> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -100,18 +100,18 @@ impl Row<'_> {
 }
 
 impl App {
-    pub fn new(catalog: Catalog, home: PathBuf) -> App {
+    pub fn new(catalog: Catalog, canonical_home: PathBuf) -> App {
         let mut app = App {
             reach: probing(&catalog),
             catalog,
-            home,
+            canonical_home,
             view: View::Tree,
             collapsed: BTreeSet::new(),
             cursor: None,
             mode: Mode::List,
             status: None,
         };
-        fix_cursor(&mut app);
+        reveal_cursor(&mut app);
         app
     }
 
@@ -178,11 +178,11 @@ pub fn update(app: &mut App, event: Event) -> Option<Effect> {
             None
         }
     };
-    fix_cursor(app);
+    reveal_cursor(app);
     effect
 }
 
-fn command(key: &KeyEvent) -> Option<char> {
+fn plain_char(key: &KeyEvent) -> Option<char> {
     match key.code {
         KeyCode::Char(c) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => Some(c),
         _ => None,
@@ -191,7 +191,7 @@ fn command(key: &KeyEvent) -> Option<char> {
 
 fn list_key(app: &mut App, key: KeyEvent) -> Option<Effect> {
     let alias = app.selected().map(|h| h.alias.clone());
-    match (key.code, command(&key)) {
+    match (key.code, plain_char(&key)) {
         (KeyCode::Down, _) | (_, Some('j')) => move_cursor(app, 1),
         (KeyCode::Up, _) | (_, Some('k')) => move_cursor(app, -1),
         (KeyCode::Left, _) | (_, Some('h')) => collapse(app),
@@ -256,10 +256,10 @@ fn confirm_delete(app: &mut App, alias: Alias) {
     let config = &app.catalog.config;
     let Some(entry) = config.host(&alias) else { return };
     match config.plan(&HostChange::Delete(alias.clone())) {
-        Ok(plan) => {
+        Ok(ssh) => {
             let (path, line) = config.location(entry);
-            let prompt = format!("Delete {alias} from `{}` in {}:{line}? (y/n)", config.host_line(entry), tilde(path, &app.home));
-            let on_yes = Effect::Save { plan, meta: vec![MetaOp::Remove(alias)] };
+            let prompt = format!("Delete {alias} from `{}` in {}:{line}? (y/n)", config.host_line(entry), tilde(path, &app.canonical_home));
+            let on_yes = Effect::Save { ssh, meta: vec![MetaOp::Remove(alias)] };
             app.mode = Mode::Confirm { prompt, on_yes };
         }
         Err(e) => app.status = Some(e.to_string()),
@@ -327,21 +327,21 @@ fn form_key(app: &mut App, mut form: Form, key: KeyEvent) -> Option<Effect> {
     let effect = match form.handle_key(key) {
         FormAction::Cancel => return None,
         FormAction::Continue => None,
-        FormAction::Submit => submit(&app.catalog.config, &app.home, &mut form),
+        FormAction::Submit => submit(&app.catalog.config, &app.canonical_home, &mut form),
     };
     app.mode = Mode::Form(form);
     effect
 }
 
-fn submit(config: &ConfigSet, home: &Path, form: &mut Form) -> Option<Effect> {
+fn submit(config: &ConfigSet, canonical_home: &Path, form: &mut Form) -> Option<Effect> {
     form.error = None;
     form.banner = None;
     let sub = form.submission().map_err(|e| form.error = Some(e)).ok()?;
     match config.plan(&sub.change) {
-        Ok(plan) => return Some(Effect::Save { plan, meta: sub.meta }),
+        Ok(ssh) => return Some(Effect::Save { ssh, meta: sub.meta }),
         Err(PlanError::AliasTaken(alias)) => form.error = Some((FieldId::Alias, format!("{alias} is already defined"))),
         Err(PlanError::ReadOnly(path)) => {
-            form.banner = Some(format!("{} is read-only. Only group and notes can change.", tilde(&path, home)));
+            form.banner = Some(format!("{} is read-only. Only group and notes can change.", tilde(&path, canonical_home)));
         }
         Err(e) => form.banner = Some(e.to_string()),
     }
@@ -349,7 +349,7 @@ fn submit(config: &ConfigSet, home: &Path, form: &mut Form) -> Option<Effect> {
 }
 
 fn confirm_key(app: &mut App, prompt: String, on_yes: Effect, key: KeyEvent) -> Option<Effect> {
-    match (key.code, command(&key)) {
+    match (key.code, plain_char(&key)) {
         (_, Some('y')) => Some(on_yes),
         (KeyCode::Esc, _) | (_, Some('n')) => None,
         _ => {
@@ -360,7 +360,7 @@ fn confirm_key(app: &mut App, prompt: String, on_yes: Effect, key: KeyEvent) -> 
 }
 
 fn set_group_key(app: &mut App, alias: Alias, mut input: String, key: KeyEvent) -> Option<Effect> {
-    match (key.code, command(&key)) {
+    match (key.code, plain_char(&key)) {
         (KeyCode::Esc, _) => return None,
         (KeyCode::Enter, _) => match GroupPath::parse(&input) {
             Ok(group) => return Some(Effect::Meta(vec![MetaOp::SetGroup(alias, group)])),
@@ -374,7 +374,7 @@ fn set_group_key(app: &mut App, alias: Alias, mut input: String, key: KeyEvent) 
     None
 }
 
-fn fix_cursor(app: &mut App) {
+fn reveal_cursor(app: &mut App) {
     let visible = |app: &App| rows(app).iter().filter_map(Row::key).any(|k| Some(&k) == app.cursor.as_ref());
     if visible(app) {
         return;
@@ -400,7 +400,10 @@ pub fn rows(app: &App) -> Vec<Row<'_>> {
     let mut hosts: Vec<&HostEntry> = catalog.config.hosts().iter().collect();
     hosts.sort_by(|a, b| a.alias.cmp(&b.alias));
     if app.view == View::Recent {
-        hosts.sort_by_key(|h| Reverse(catalog.meta(&h.alias).last_used));
+        hosts.sort_by_key(|h| {
+            let used = catalog.meta(&h.alias).last_used;
+            (used.is_none(), Reverse(used))
+        });
         return flat(hosts);
     }
 
@@ -446,18 +449,24 @@ fn tree<'a>(app: &'a App, hosts: &[&'a HostEntry], groups: &BTreeSet<GroupPath>,
     );
 }
 
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum MatchedOn {
+    Details,
+    Alias,
+}
+
 pub fn search<'a>(catalog: &'a Catalog, query: &str) -> Vec<&'a HostEntry> {
     let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
     let mut matcher = Matcher::new(Config::DEFAULT);
     let mut buf = Vec::new();
     let mut score = |text: &str| pattern.score(Utf32Str::new(text, &mut buf), &mut matcher);
-    let mut ranked: Vec<(bool, u32, &HostEntry)> = catalog
+    let mut ranked: Vec<(MatchedOn, u32, &HostEntry)> = catalog
         .config
         .hosts()
         .iter()
         .filter_map(|h| {
             if let Some(s) = score(h.alias.as_str()) {
-                return Some((true, s, h));
+                return Some((MatchedOn::Alias, s, h));
             }
             let meta = catalog.meta(&h.alias);
             let haystack = [
@@ -471,10 +480,10 @@ pub fn search<'a>(catalog: &'a Catalog, query: &str) -> Vec<&'a HostEntry> {
             .flatten()
             .collect::<Vec<_>>()
             .join(" ");
-            score(&haystack).map(|s| (false, s, h))
+            score(&haystack).map(|s| (MatchedOn::Details, s, h))
         })
         .collect();
-    ranked.sort_by(|a, b| (b.0, b.1).cmp(&(a.0, a.1)).then_with(|| a.2.alias.cmp(&b.2.alias)));
+    ranked.sort_by(|a, b| (&b.0, b.1).cmp(&(&a.0, a.1)).then_with(|| a.2.alias.cmp(&b.2.alias)));
     ranked.into_iter().map(|(_, _, h)| h).collect()
 }
 
@@ -714,7 +723,7 @@ mod tests {
         let Mode::Confirm { prompt, .. } = &f.app.mode else { panic!("expected confirm") };
         assert!(prompt.starts_with("Delete db from `Host db` in "), "{prompt}");
         let effects = press(&mut f.app, "y");
-        assert!(matches!(&effects[..], [Effect::Save { plan: Some(_), meta }] if *meta == [MetaOp::Remove(alias("db"))]));
+        assert!(matches!(&effects[..], [Effect::Save { ssh: ConfigEdit::Write(_), meta }] if *meta == [MetaOp::Remove(alias("db"))]));
         assert_eq!(mode(&f.app), "list");
     }
 
@@ -782,13 +791,13 @@ mod tests {
     }
 
     #[test]
-    fn e_untouched_ctrl_s_emits_save_with_no_plan() {
+    fn e_untouched_ctrl_s_emits_save_with_ssh_unchanged() {
         let mut f = fixture(CONFIG, &[("db", meta(Some("ops"), false, None, Some("n")))]);
         cursor_on(&mut f.app, "db");
         press(&mut f.app, "e");
         assert_eq!(mode(&f.app), "form");
         let effect = update(&mut f.app, ctrl('s'));
-        let Some(Effect::Save { plan: None, meta }) = effect else { panic!("expected meta-only save") };
+        let Some(Effect::Save { ssh: ConfigEdit::Unchanged, meta }) = effect else { panic!("expected meta-only save") };
         assert_eq!(meta, [MetaOp::SetGroup(alias("db"), Some(group("ops"))), MetaOp::SetNotes(alias("db"), Some("n".into()))]);
         assert_eq!(mode(&f.app), "form");
     }
@@ -810,7 +819,7 @@ mod tests {
         let mut f = plain();
         cursor_on(&mut f.app, "db");
         press(&mut f.app, "e2");
-        let Some(Effect::Save { plan: Some(plan), .. }) = update(&mut f.app, ctrl('s')) else { panic!("expected save") };
+        let Some(Effect::Save { ssh: ConfigEdit::Write(plan), .. }) = update(&mut f.app, ctrl('s')) else { panic!("expected save") };
         commit(&plan).unwrap();
         let reloaded = catalog(&f.dir, &[]);
         update(&mut f.app, Event::Loaded { catalog: reloaded, reason: LoadReason::Saved });

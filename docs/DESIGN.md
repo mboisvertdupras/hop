@@ -39,7 +39,7 @@ let sub = match form.submission() {
     Err(field_error) => { form.error = Some(field_error); app.mode = Mode::Form(form); return None; }
 };
 match app.catalog.config.plan(&sub.change) {
-    Ok(plan) => { app.mode = Mode::Form(form); Some(Effect::Save { plan, meta: sub.meta }) }
+    Ok(ssh) => { app.mode = Mode::Form(form); Some(Effect::Save { ssh, meta: sub.meta }) }
     Err(PlanError::ReadOnly(path)) => { /* error on the form, naming path */ None }
     Err(e) => { /* AliasTaken -> alias field, NotFound -> banner */ None }
 }
@@ -50,17 +50,18 @@ The form stays open until the shell answers with `Event::Loaded { reason: Saved 
 ### Call site 2: the shell executes it
 
 ```rust
-// main.rs, Shell::run
-Effect::Save { plan, meta } => match plan.as_ref().map(ssh_config::commit).transpose() {
-    Ok(_) => {
-        let meta_failure = self.store.update(&meta).err();      // ssh file first, then meta
-        let mut events = vec![self.load(LoadReason::Saved)];     // reload even if meta failed
-        events.extend(meta_failure.map(|e| Event::Failed(format!("meta.toml: {e:?}"))));
-        events
+// main.rs, Shell::save, called from Shell::run on Effect::Save { ssh, meta }
+if let ConfigEdit::Write(plan) = ssh {                           // ssh file first, then meta
+    match ssh_config::commit(&plan) {
+        Ok(()) => {}
+        Err(CommitError::Stale) => return vec![self.load(LoadReason::Refused)],
+        Err(CommitError::Io(e)) => return vec![Event::Failed(e.to_string())],
     }
-    Err(CommitError::Stale) => vec![self.load(LoadReason::Refused)],
-    Err(CommitError::Io(e)) => vec![Event::Failed(e.to_string())],
 }
+let meta_failure = self.store.update(meta).err();
+let mut events = vec![self.load(LoadReason::Saved)];             // reload even if meta failed
+events.extend(meta_failure.map(|e| Event::Failed(self.meta_error(e))));
+events
 ```
 
 ### Call site 3: a test proves "bytes elsewhere unchanged"
@@ -71,7 +72,7 @@ write(dir.join("config"), "Include conf.d/*\n\n# work\nHost web web.example.com\
 let set = ConfigSet::load(&dir.join("config"), dir.path())?;
 let web = set.host(&alias("web")).unwrap();
 let spec = HostSpec { alias: alias("web"), core: core_with(&web.core, CoreKey::HostName, "10.0.0.6"), extras: web.extras.clone() };
-let plan = set.plan(&HostChange::Update { alias: alias("web"), spec })?.unwrap();
+let ConfigEdit::Write(plan) = set.plan(&HostChange::Update { alias: alias("web"), spec })? else { panic!("expected a change") };
 write(dir.join("config"), read(dir.join("config")).replace("ServerAliveInterval 30", "ServerAliveInterval 60")); // concurrent edit elsewhere
 ssh_config::commit(&plan)?;
 assert_eq!(read(dir.join("config")), "Include conf.d/*\n\n# work\nHost web web.example.com\n  HostName=10.0.0.6\n\tUser deploy  \n\nHost *\n  ServerAliveInterval 60\n");
@@ -122,7 +123,7 @@ A **block** is a byte range: its attached leading comments, the `Host` or `Match
 
 `CoreKey` is the single list of the five form fields. Parsing, patching, and the form's field order all iterate `CoreKey::ALL`. A sixth key is one enum variant, and the compiler finds every match.
 
-Core values are **raw strings, not typed**. `Core([Option<String>; 5])` holds what the file says, unquoted. hop never consumes the port or the identity path itself (probing asks `ssh -G`), so typing them would only add a normalization step that breaks the identity law. `Port 022` would become `22` and the line would be rewritten on an untouched save. `ValidCore` is the form-side wrapper. It checks that Port parses as 1..=65535 and keeps the text verbatim, per type-system-discipline ("strengthen a type only where partiality appears").
+Core values are **raw strings, not typed**. `Core = ByCore<Option<String>>`, one slot per `CoreKey`, holds what the file says, unquoted. hop never consumes the port or the identity path itself (probing asks `ssh -G`), so typing them would only add a normalization step that breaks the identity law. `Port 022` would become `22` and the line would be rewritten on an untouched save. `ValidCore` is the form-side wrapper. It checks that Port parses as 1..=65535 and keeps the text verbatim, per type-system-discipline ("strengthen a type only where partiality appears").
 
 `Extras` is the verbatim, de-indented text of every non-core line in the block body. That covers other directives, comments, blank lines, and a second `IdentityFile`. It is not the spec's `Vec<(key, value)>`, because comments inside a block have to survive and the form shows this text in its free-text area. Its constructor rejects `Host` and `Match` lines, since one would split the block on write.
 
@@ -134,7 +135,7 @@ Core values are **raw strings, not typed**. `Core([Option<String>; 5])` holds wh
 
 ### How the surgical edit works
 
-`ConfigSet::plan` is pure. It turns a `HostChange` into a `Plan { path, op }` against the loaded text, or `Ok(None)` when the ssh config needs no change.
+`ConfigSet::plan` is pure. It turns a `HostChange` into `ConfigEdit::Write(Plan { path, op })` against the loaded text, or `ConfigEdit::Unchanged` when the ssh config needs no change.
 
 **Update** builds the new block text with splices relative to the block, in `rewrite_block`.
 
@@ -143,7 +144,7 @@ Core values are **raw strings, not typed**. `Core([Option<String>; 5])` holds wh
 - Extras that equal the loaded extras are untouched. Edited extras replace all extra lines and are appended, re-indented, at the block end. The rule is that untouched text is byte-identical and edited text is normalized.
 - Values containing whitespace are written in double quotes.
 
-The **identity law** follows. `rewrite_block` with the entry's own spec returns the original block text. `plan` then returns `Ok(None)`. A meta-only save (group, notes) never touches the ssh file. That is also why a host in a read-only Include can still be grouped, favorited, and annotated. `ReadOnly` is raised only when a non-empty ssh change is needed.
+The **identity law** follows. `rewrite_block` with the entry's own spec returns the original block text. `plan` then returns `Ok(ConfigEdit::Unchanged)`. A meta-only save (group, notes) never touches the ssh file. That is also why a host in a read-only Include can still be grouped, favorited, and annotated. `ReadOnly` is raised only when a non-empty ssh change is needed.
 
 **Delete** removes the alias token (plus one adjacent whitespace run) when the Host line has other tokens. It removes the whole block when the alias is the only token. Whole-block removal also eats the following blank lines when the block is preceded by a blank line or the start of the file, so deletions do not accumulate double gaps. Comments outside the block span are never removed.
 
@@ -213,7 +214,7 @@ Why a 50 ms poll and not an input thread? A crossterm reader thread would still 
 | Search | Esc | List (tree, cursor on alias, its groups expanded) | none |
 | Form | Tab, text, Enter | Form | none |
 | Form | Ctrl-S, invalid | Form (field error) | none |
-| Form | Ctrl-S, valid | Form (awaits Loaded) | `Save { plan, meta }` |
+| Form | Ctrl-S, valid | Form (awaits Loaded) | `Save { ssh, meta }` |
 | Form | Esc | List | none |
 | Confirm | `y` | List | the stored `on_yes` |
 | Confirm | `n`, Esc | List | none |

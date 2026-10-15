@@ -28,9 +28,6 @@ impl FieldId {
             FieldId::Extras => "Other directives",
         }
     }
-    fn index(self) -> usize {
-        FieldId::all().position(|f| f == self).expect("every field is in all()")
-    }
 }
 
 pub enum FormKind {
@@ -40,7 +37,7 @@ pub enum FormKind {
 
 pub struct Form {
     pub kind: FormKind,
-    pub inputs: Vec<TextArea<'static>>,
+    pub fields: Vec<(FieldId, TextArea<'static>)>,
     pub focus: usize,
     pub error: Option<(FieldId, String)>,
     pub banner: Option<String>,
@@ -68,7 +65,7 @@ impl Form {
     pub fn add() -> Form {
         Form {
             kind: FormKind::Add,
-            inputs: FieldId::all().map(|_| TextArea::default()).collect(),
+            fields: FieldId::all().map(|f| (f, TextArea::default())).collect(),
             focus: 0,
             error: None,
             banner: None,
@@ -85,7 +82,7 @@ impl Form {
         };
         Form {
             kind: FormKind::Edit { original: entry.alias.clone(), siblings: entry.siblings.clone() },
-            inputs: FieldId::all().map(|f| text_area(&value(f))).collect(),
+            fields: FieldId::all().map(|f| (f, text_area(&value(f)))).collect(),
             focus: 0,
             error: None,
             banner: None,
@@ -93,32 +90,36 @@ impl Form {
     }
 
     pub fn focused(&self) -> FieldId {
-        FieldId::all().nth(self.focus).unwrap_or(FieldId::Alias)
+        self.fields[self.focus].0
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> FormAction {
-        let fields = self.inputs.len();
+        let count = self.fields.len();
         match key.code {
             KeyCode::Esc => return FormAction::Cancel,
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => return FormAction::Submit,
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 // The widget's own Ctrl-U is undo.
-                let input = &mut self.inputs[self.focus];
+                let input = &mut self.fields[self.focus].1;
                 input.select_all();
                 input.cut();
             }
-            KeyCode::Tab => self.focus = (self.focus + 1) % fields,
-            KeyCode::BackTab => self.focus = (self.focus + fields - 1) % fields,
-            KeyCode::Enter if self.focused() != FieldId::Extras => self.focus = (self.focus + 1) % fields,
+            KeyCode::Tab => self.focus = (self.focus + 1) % count,
+            KeyCode::BackTab => self.focus = (self.focus + count - 1) % count,
+            KeyCode::Enter if self.focused() != FieldId::Extras => self.focus = (self.focus + 1) % count,
             _ => {
-                self.inputs[self.focus].input(key);
+                self.fields[self.focus].1.input(key);
             }
         }
         FormAction::Continue
     }
 
+    fn input(&self, field: FieldId) -> &TextArea<'static> {
+        &self.fields.iter().find(|(f, _)| *f == field).expect("every field has an input").1
+    }
+
     fn text(&self, field: FieldId) -> String {
-        self.inputs[field.index()].lines().join("\n")
+        self.input(field).lines().join("\n")
     }
 
     fn value(&self, field: FieldId) -> Option<String> {
@@ -129,7 +130,7 @@ impl Form {
 
     pub fn submission(&self) -> Result<Submission, (FieldId, String)> {
         let alias = Alias::parse(self.text(FieldId::Alias).trim()).map_err(|e| (FieldId::Alias, e.to_string()))?;
-        let core = Core(CoreKey::ALL.map(|k| self.value(FieldId::Core(k))));
+        let core = Core::from_fn(|k| self.value(FieldId::Core(k)));
         let core = ValidCore::parse(core).map_err(|(k, e)| (FieldId::Core(k), e.to_owned()))?;
         let group = GroupPath::parse(&self.text(FieldId::Group)).map_err(|e| (FieldId::Group, e.to_string()))?;
         let notes = self.value(FieldId::Notes);
@@ -161,7 +162,7 @@ impl Form {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ssh_config::ConfigSet;
+    use crate::ssh_config::{ConfigEdit, ConfigSet};
     use std::fs;
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -209,7 +210,7 @@ mod tests {
         assert_eq!(spec.alias, web.alias);
         assert_eq!(spec.core, ValidCore::parse(web.core.clone()).unwrap());
         assert_eq!(spec.extras, web.extras);
-        assert!(set.plan(&sub.change).unwrap().is_none());
+        assert!(matches!(set.plan(&sub.change), Ok(ConfigEdit::Unchanged)));
         assert_eq!(sub.meta, [MetaOp::SetGroup(web.alias.clone(), Some(group("a/b"))), MetaOp::SetNotes(web.alias.clone(), Some("vpn".into()))]);
     }
 
@@ -248,7 +249,7 @@ mod tests {
         focus(&mut form, FieldId::Extras);
         form.handle_key(key(KeyCode::Enter));
         assert_eq!(form.focused(), FieldId::Extras);
-        assert_eq!(form.inputs[form.focus].lines().len(), 2);
+        assert_eq!(form.fields[form.focus].1.lines().len(), 2);
     }
 
     #[test]

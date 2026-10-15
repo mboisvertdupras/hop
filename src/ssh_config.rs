@@ -104,20 +104,28 @@ impl CoreKey {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Core(pub [Option<String>; 5]);
+pub struct ByCore<T>([T; CoreKey::ALL.len()]);
 
-impl std::ops::Index<CoreKey> for Core {
-    type Output = Option<String>;
-    fn index(&self, k: CoreKey) -> &Option<String> {
+impl<T> ByCore<T> {
+    pub fn from_fn(f: impl FnMut(CoreKey) -> T) -> Self {
+        ByCore(CoreKey::ALL.map(f))
+    }
+}
+
+impl<T> std::ops::Index<CoreKey> for ByCore<T> {
+    type Output = T;
+    fn index(&self, k: CoreKey) -> &T {
         &self.0[k as usize]
     }
 }
 
-impl std::ops::IndexMut<CoreKey> for Core {
-    fn index_mut(&mut self, k: CoreKey) -> &mut Option<String> {
+impl<T> std::ops::IndexMut<CoreKey> for ByCore<T> {
+    fn index_mut(&mut self, k: CoreKey) -> &mut T {
         &mut self.0[k as usize]
     }
 }
+
+pub type Core = ByCore<Option<String>>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ValidCore(Core);
@@ -182,6 +190,8 @@ pub enum HostChange {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FileId(usize);
+
+const ROOT: FileId = FileId(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlockRef {
@@ -367,6 +377,10 @@ impl ConfigSet {
         Ok(ConfigSet { files: loader.files, hosts: loader.hosts })
     }
 
+    fn root(&self) -> &ConfigFile {
+        &self.files[ROOT.0]
+    }
+
     pub fn hosts(&self) -> &[HostEntry] {
         &self.hosts
     }
@@ -390,18 +404,18 @@ impl ConfigSet {
         file.text[line.span.clone()].trim()
     }
 
-    pub fn plan(&self, change: &HostChange) -> Result<Option<Plan>, PlanError> {
+    pub fn plan(&self, change: &HostChange) -> Result<ConfigEdit, PlanError> {
         match change {
             HostChange::Add(spec) => {
                 if self.host(&spec.alias).is_some() {
                     return Err(PlanError::AliasTaken(spec.alias.clone()));
                 }
-                let root = &self.files[0];
+                let root = self.root();
                 if !root.writable {
                     return Err(PlanError::ReadOnly(root.path.clone()));
                 }
                 let block = render_new_block(spec, default_indent(root));
-                Ok(Some(Plan { path: root.path.clone(), op: PlanOp::Insert { block } }))
+                Ok(ConfigEdit::Write(Plan { path: root.path.clone(), op: PlanOp::Insert { block } }))
             }
             HostChange::Update { alias, spec } => {
                 let entry = self.host(alias).ok_or_else(|| PlanError::NotFound(alias.clone()))?;
@@ -411,10 +425,10 @@ impl ConfigSet {
                 let file = &self.files[entry.block.file.0];
                 let replacement = rewrite_block(file, entry.block.block, alias, spec);
                 if replacement == file.block_text(entry.block.block) {
-                    return Ok(None);
+                    return Ok(ConfigEdit::Unchanged);
                 }
                 let (expected, ordinal) = self.address(entry)?;
-                Ok(Some(Plan { path: file.path.clone(), op: PlanOp::Rewrite { expected, ordinal, replacement } }))
+                Ok(ConfigEdit::Write(Plan { path: file.path.clone(), op: PlanOp::Rewrite { expected, ordinal, replacement } }))
             }
             HostChange::Delete(alias) => {
                 let entry = self.host(alias).ok_or_else(|| PlanError::NotFound(alias.clone()))?;
@@ -429,7 +443,7 @@ impl ConfigSet {
                     let replacement = remove_name(file, entry.block.block, alias);
                     PlanOp::Rewrite { expected, ordinal, replacement }
                 };
-                Ok(Some(Plan { path: file.path.clone(), op }))
+                Ok(ConfigEdit::Write(Plan { path: file.path.clone(), op }))
             }
         }
     }
@@ -466,6 +480,11 @@ impl fmt::Display for PlanError {
             PlanError::ReadOnly(p) => write!(f, "{} is read-only", p.display()),
         }
     }
+}
+
+pub enum ConfigEdit {
+    Unchanged,
+    Write(Plan),
 }
 
 #[derive(Clone, Debug)]
@@ -590,20 +609,7 @@ fn parse(text: &str) -> Parsed {
     let headers: Vec<usize> = (0..lines.len())
         .filter(|&i| matches!(&lines[i].kind, LineKind::Directive { key, .. } if is_header_key(&text[key.clone()])))
         .collect();
-    let firsts: Vec<usize> = headers
-        .iter()
-        .map(|&h| {
-            let indent = indent_len(text, &lines[h]);
-            let mut first = h;
-            while first > 0
-                && matches!(lines[first - 1].kind, LineKind::Comment)
-                && indent_len(text, &lines[first - 1]) <= indent
-            {
-                first -= 1;
-            }
-            first
-        })
-        .collect();
+    let firsts: Vec<usize> = headers.iter().map(|&h| attached_start(text, &lines, h)).collect();
     let blocks = headers
         .iter()
         .enumerate()
@@ -630,6 +636,19 @@ fn parse(text: &str) -> Parsed {
     Parsed { lines, blocks }
 }
 
+/// Comments directly above a header, indented no deeper, belong to its block, so they move and delete with it.
+fn attached_start(text: &str, lines: &[Line], header: usize) -> usize {
+    let indent = indent_len(text, &lines[header]);
+    let mut first = header;
+    while first > 0
+        && matches!(lines[first - 1].kind, LineKind::Comment)
+        && indent_len(text, &lines[first - 1]) <= indent
+    {
+        first -= 1;
+    }
+    first
+}
+
 fn host_tokens(text: &str, value: Span) -> Vec<(HostToken, Span)> {
     let mut tokens = Vec::new();
     let mut at = value.start;
@@ -649,16 +668,20 @@ fn unquote(value: &str) -> &str {
         .unwrap_or(value)
 }
 
-fn classify(file: &ConfigFile, block: &Block) -> ([Option<usize>; 5], Vec<usize>) {
-    let mut core = [None; 5];
+/// A core keyword with no value sets nothing: read as core, an untouched save would delete its line.
+fn sets_core_key(file: &ConfigFile, line: &Line) -> Option<CoreKey> {
+    match &line.kind {
+        LineKind::Directive { key, value } if !value.is_empty() => CoreKey::from_keyword(&file.text[key.clone()]),
+        _ => None,
+    }
+}
+
+fn classify(file: &ConfigFile, block: &Block) -> (ByCore<Option<usize>>, Vec<usize>) {
+    let mut core = ByCore::<Option<usize>>::default();
     let mut extras = Vec::new();
     for i in block.body.clone() {
-        let key = match &file.parsed.lines[i].kind {
-            LineKind::Directive { key, value } if !value.is_empty() => CoreKey::from_keyword(&file.text[key.clone()]),
-            _ => None,
-        };
-        match key {
-            Some(k) if core[k as usize].is_none() => core[k as usize] = Some(i),
+        match sets_core_key(file, &file.parsed.lines[i]) {
+            Some(k) if core[k].is_none() => core[k] = Some(i),
             _ => extras.push(i),
         }
     }
@@ -674,7 +697,7 @@ fn value_of(file: &ConfigFile, line: usize) -> &str {
 
 fn block_fields(file: &ConfigFile, block: &Block) -> (Core, Extras) {
     let (lines, extras) = classify(file, block);
-    let core = Core(lines.map(|l| l.map(|l| value_of(file, l).to_owned())));
+    let core = Core::from_fn(|k| lines[k].map(|l| value_of(file, l).to_owned()));
     let extras = extras
         .iter()
         .map(|&i| file.text[file.parsed.lines[i].span.clone()].trim_end_matches('\n').trim_start())
@@ -751,7 +774,7 @@ fn rewrite_block(file: &ConfigFile, block: usize, editing: &Alias, spec: &HostSp
     let mut deleted = HashSet::new();
     let mut new_core = Vec::new();
     for k in CoreKey::ALL {
-        match (core[k as usize], spec.core.get(k)) {
+        match (core[k], spec.core.get(k)) {
             (Some(line), Some(v)) if value_of(file, line) != v => {
                 let LineKind::Directive { value, .. } = &file.parsed.lines[line].kind else { unreachable!() };
                 edits.push((value.clone(), render_value(v).into_owned()));
@@ -776,7 +799,7 @@ fn rewrite_block(file: &ConfigFile, block: usize, editing: &Alias, spec: &HostSp
         render_extras(&spec.extras, indent)
     };
 
-    let core_anchor = core.into_iter().flatten().filter(|l| !deleted.contains(l)).max().unwrap_or(b.header);
+    let core_anchor = CoreKey::ALL.into_iter().filter_map(|k| core[k]).filter(|l| !deleted.contains(l)).max().unwrap_or(b.header);
     let end_anchor = (b.header..b.body.end).rev().find(|l| !deleted.contains(l)).unwrap_or(b.header);
     edits.extend(insert_after(file, core_anchor, &new_core));
     edits.extend(insert_after(file, end_anchor, &new_extras));
@@ -897,9 +920,13 @@ mod tests {
         HostSpec { core: ValidCore::parse(core).unwrap(), ..spec_of(entry) }
     }
 
+    fn planned(set: &ConfigSet, change: HostChange) -> Plan {
+        let ConfigEdit::Write(plan) = set.plan(&change).unwrap() else { panic!("expected a change to the ssh config") };
+        plan
+    }
+
     fn edited(set: &ConfigSet, change: HostChange) -> String {
-        let plan = set.plan(&change).unwrap().expect("a change to the ssh config");
-        rebase(&set.files[0].text, &plan.op).unwrap()
+        rebase(&set.root().text, &planned(set, change).op).unwrap()
     }
 
     fn update(set: &ConfigSet, name: &str, spec: impl FnOnce(&HostEntry) -> HostSpec) -> String {
@@ -934,7 +961,7 @@ mod tests {
                 let spec = spec_of(entry);
                 assert_eq!(rewrite_block(file, entry.block.block, &entry.alias, &spec), file.block_text(entry.block.block));
                 let change = HostChange::Update { alias: entry.alias.clone(), spec };
-                assert!(set.plan(&change).unwrap().is_none(), "{} in {text:?}", entry.alias);
+                assert!(matches!(set.plan(&change), Ok(ConfigEdit::Unchanged)), "{} in {text:?}", entry.alias);
             }
         }
     }
@@ -1123,7 +1150,7 @@ mod tests {
         let path = dir.path().join(".ssh/config");
         let web = set.host(&alias("web")).unwrap();
         let spec = with_core(web, CoreKey::HostName, Some("10.0.0.6"));
-        let plan = set.plan(&HostChange::Update { alias: alias("web"), spec }).unwrap().unwrap();
+        let plan = planned(&set, HostChange::Update { alias: alias("web"), spec });
         fs::write(&path, WORK.replace("ServerAliveInterval 30", "ServerAliveInterval 60")).unwrap();
         commit(&plan).unwrap();
         assert_eq!(
@@ -1137,7 +1164,7 @@ mod tests {
         let (dir, set) = fixture(WORK);
         let path = dir.path().join(".ssh/config");
         let spec = with_core(set.host(&alias("web")).unwrap(), CoreKey::User, Some("ops"));
-        let plan = set.plan(&HostChange::Update { alias: alias("web"), spec }).unwrap().unwrap();
+        let plan = planned(&set, HostChange::Update { alias: alias("web"), spec });
         let changed = WORK.replace("User deploy", "User root");
         fs::write(&path, &changed).unwrap();
         assert!(matches!(commit(&plan), Err(CommitError::Stale)));
@@ -1147,7 +1174,7 @@ mod tests {
     #[test]
     fn commit_twice_applies_once() {
         let (dir, set) = fixture(WORK);
-        let plan = set.plan(&HostChange::Delete(alias("web"))).unwrap().unwrap();
+        let plan = planned(&set, HostChange::Delete(alias("web")));
         commit(&plan).unwrap();
         let once = fs::read_to_string(dir.path().join(".ssh/config")).unwrap();
         assert!(matches!(commit(&plan), Err(CommitError::Stale)));
@@ -1168,7 +1195,7 @@ mod tests {
 
         let set = ConfigSet::load(&ssh.join("config"), &ssh).unwrap();
         let spec = with_core(set.host(&alias("web")).unwrap(), CoreKey::User, Some("ops"));
-        commit(&set.plan(&HostChange::Update { alias: alias("web"), spec }).unwrap().unwrap()).unwrap();
+        commit(&planned(&set, HostChange::Update { alias: alias("web"), spec })).unwrap();
 
         assert!(fs::symlink_metadata(ssh.join("config")).unwrap().file_type().is_symlink());
         assert_eq!(fs::read_to_string(&real).unwrap(), WORK.replace("User deploy", "User ops"));
@@ -1181,7 +1208,7 @@ mod tests {
         let ssh = dir.path().join(".ssh");
         let set = ConfigSet::load(&ssh.join("config"), &ssh).unwrap();
         assert!(set.hosts().is_empty());
-        commit(&set.plan(&HostChange::Add(new_host())).unwrap().unwrap()).unwrap();
+        commit(&planned(&set, HostChange::Add(new_host()))).unwrap();
         assert_eq!(fs::read_to_string(ssh.join("config")).unwrap(), "Host new\n    HostName 10.0.0.9\n");
         assert_eq!(fs::metadata(&ssh).unwrap().permissions().mode() & 0o777, 0o700);
         assert_eq!(fs::metadata(ssh.join("config")).unwrap().permissions().mode() & 0o777, 0o600);
@@ -1246,7 +1273,7 @@ mod tests {
         let locked = set.host(&alias("locked")).unwrap();
         assert!(!set.is_writable(locked));
         let untouched = HostChange::Update { alias: alias("locked"), spec: spec_of(locked) };
-        assert!(set.plan(&untouched).unwrap().is_none());
+        assert!(matches!(set.plan(&untouched), Ok(ConfigEdit::Unchanged)));
         let changed = HostChange::Update { alias: alias("locked"), spec: with_core(locked, CoreKey::User, Some("x")) };
         assert!(matches!(set.plan(&changed), Err(PlanError::ReadOnly(_))));
         assert!(matches!(set.plan(&HostChange::Delete(alias("locked"))), Err(PlanError::ReadOnly(_))));
