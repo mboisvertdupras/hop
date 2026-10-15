@@ -2,6 +2,16 @@
 name = "hop"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+description = "A terminal UI for browsing, organizing, editing, and connecting to the hosts in ~/.ssh/config"
+authors = ["Marc Boisvert-Dupras <marc@tamarak.dev>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/mboisvertdupras/hop"
+homepage = "https://github.com/mboisvertdupras/hop"
+readme = "README.md"
+keywords = ["ssh", "ssh-config", "tui", "terminal", "cli"]
+categories = ["command-line-utilities", "network-programming"]
+publish = false
 
 [dependencies]
 ratatui = "0.30.2"                                 # TUI; re-exports crossterm 0.29, so no second pin
