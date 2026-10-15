@@ -3,7 +3,7 @@ name = "hop"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "A terminal UI for browsing, organizing, editing, and connecting to the hosts in ~/.ssh/config"
+description = "Terminal UI for browsing, editing, and connecting to the hosts in ~/.ssh/config"
 authors = ["Marc Boisvert-Dupras <marc@tamarak.dev>"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/mboisvertdupras/hop"
@@ -12,6 +12,10 @@ readme = "README.md"
 keywords = ["ssh", "ssh-config", "tui", "terminal", "cli"]
 categories = ["command-line-utilities", "network-programming"]
 publish = false
+
+# publish = false would otherwise hide hop from dist.
+[package.metadata.dist]
+dist = true
 
 [dependencies]
 ratatui = "0.30.2"                                 # TUI; re-exports crossterm 0.29, so no second pin
@@ -23,3 +27,8 @@ glob = "0.3.4"                                     # Include globs
 tempfile = "3.27.0"                                # same-directory temp file + atomic rename
 rustix = { version = "1.1.5", features = ["fs"] }  # access(2) for the read-only check; already in tempfile's tree
 signal-hook = "0.4.5"                              # keep hop alive when Ctrl-C hits the shared process group during ssh
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
